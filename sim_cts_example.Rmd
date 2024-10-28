@@ -1,0 +1,527 @@
+---
+title: "smart-of-1 data generation"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r}
+library(tidyverse)
+library(rstan)
+library(reshape)
+library(ggplot2)
+library(reshape2)
+library(bayestestR)
+library(lubridate)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+rstan_options(threads_per_chain = 1)
+
+```
+
+
+# Data generation function
+
+```{r}
+# data generating function
+
+SMARTof1_cts_data_generation = function(J, DELTA_A_MU, DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                                        LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA) {
+  data = tibble(
+    id = rep(1:J, each = NUM_CYCLES),
+    cycle_id = rep(1:NUM_CYCLES, J),
+    
+    # Draw from population distribution and generate individual-level response rates
+    delta_a_j = rep(rnorm(J, mean = DELTA_A_MU, sd = DELTA_A_SIGMA) %>% round(2), each = NUM_CYCLES), 
+    delta_b_j = rep(rnorm(J, mean = DELTA_B_MU, sd = DELTA_B_SIGMA) %>% round(2), each = NUM_CYCLES), 
+    
+    # Generate first stage treatments, alternating
+    stage1 = map2_chr(id, cycle_id, function(i, c) {
+      if (i %% 2 == 1 & c %% 2 == 1) {
+        stage1 = "A"
+      } else if (i %% 2 == 1 & c %% 2 == 0) {
+        stage1 = "B"
+      } else if (i %% 2 == 0 & c %% 2 == 1) {
+        stage1 = "B"
+      } else if (i %% 2 == 0 & c %% 2 == 0) {
+        stage1 = "A"
+      }
+    })
+  ) %>%
+    mutate(
+      # Generate the first stage response from the first stage treatment
+      Y1 = pmap_dbl(list(stage1, delta_a_j, delta_b_j), function(s1, da, db) {
+        if (s1 == "A") {
+          rnorm(n = 1, mean = da, sd = epsilon)
+        } else if (s1 == "B") {
+          rnorm(n = 1, mean = db, sd = epsilon)
+        }
+      })
+    ) %>%
+    group_by(cycle_id) %>%
+    mutate(
+      # Mapping to probability based on the min and max of Y1 within the same cycle_id
+      Y1_prob = (Y1 - min(Y1)) / (max(Y1) - min(Y1))
+    ) %>%
+    ungroup() %>%
+    mutate(
+      # Convert to binary
+      stay = pmap_int(list(Y1_prob), function(p) {
+        rbinom(1, size = 1, prob = p)
+      }),
+      
+      stage2 = map2_chr(stage1, stay, function(s1, y) {
+        # Choose the other treatment if first stage fails
+        if (y == 0) {
+          setdiff(c("A", "B"), s1)
+        } else {
+          s1
+        }
+      }),
+      
+      linkage = case_when(
+        stage1 == "A" & stage2 == "A" ~ LINKAGE_AA, 
+        stage1 == "B" & stage2 == "B" ~ LINKAGE_BB, 
+        stage1 == "A" & stage2 == "B" ~ LINKAGE_AB, 
+        stage1 == "B" & stage2 == "A" ~ LINKAGE_BA
+      ),
+      
+      linkage_label = case_when(
+        stage1 == "A" & stage2 == "A" ~ 1, 
+        stage1 == "B" & stage2 == "B" ~ 2, 
+        stage1 == "A" & stage2 == "B" ~ 3, 
+        stage1 == "B" & stage2 == "A" ~ 4
+      ),
+      
+      # Generate the second stage response from linkage and individual response
+      Y2 = pmap_dbl(list(stage2, delta_a_j, delta_b_j, linkage), function(s2, da, db, beta) {
+        if (s2 == "A") {
+          rnorm(n = 1, mean = da * beta, sd = epsilon)
+        } else if (s2 == "B") {
+          rnorm(n = 1, mean = db * beta, sd = epsilon)
+        }
+      })
+    )
+  
+  return(data)
+}
+Nof1_cts_data_generation = function(J, DELTA_A_MU, DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                                    LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA) {
+  data = tibble(
+    id = rep(1:J, each = NUM_CYCLES),
+    cycle_id = rep(1:NUM_CYCLES, J),
+    
+    # Draw from population distribution and generate individual-level response rates
+    delta_a_j = rep(rnorm(J, mean = DELTA_A_MU, sd = DELTA_A_SIGMA) %>% round(2), each = NUM_CYCLES), 
+    delta_b_j = rep(rnorm(J, mean = DELTA_B_MU, sd = DELTA_B_SIGMA) %>% round(2), each = NUM_CYCLES), 
+    
+    # Generate first stage treatments, alternating
+    stage1 = map2_chr(id, cycle_id, function(i, c) {
+      if (i %% 2 == 1 & c %% 2 == 1) {
+        stage1 = "A"
+      } else if (i %% 2 == 1 & c %% 2 == 0) {
+        stage1 = "B"
+      } else if (i %% 2 == 0 & c %% 2 == 1) {
+        stage1 = "B"
+      } else if (i %% 2 == 0 & c %% 2 == 0) {
+        stage1 = "A"
+      }
+    })
+  ) %>%
+    mutate(
+      # Generate the first stage response from the first stage treatment
+      Y1 = pmap_dbl(list(stage1, delta_a_j, delta_b_j), function(s1, da, db) {
+        if (s1 == "A") {
+          rnorm(n = 1, mean = da, sd = epsilon)
+        } else if (s1 == "B") {
+          rnorm(n = 1, mean = db, sd = epsilon)
+        }
+      })
+    ) %>%
+    group_by(cycle_id) %>%
+    mutate(
+      # Mapping to probability based on the min and max of Y1 within the same cycle_id
+      Y1_prob = (Y1 - min(Y1)) / (max(Y1) - min(Y1))
+    ) %>%
+    ungroup() %>%
+    mutate(
+      # Convert to binary
+      should_stay = pmap_int(list(Y1_prob), function(p) {
+        rbinom(1, size = 1, prob = p)
+      }),
+      
+      stage2 = map_chr(stage1, function(s1) {
+        # Choose the other treatment
+        setdiff(c("A", "B"), s1)
+      }),
+      
+      linkage = case_when(
+        stage1 == "A" & stage2 == "A" ~ LINKAGE_AA, 
+        stage1 == "B" & stage2 == "B" ~ LINKAGE_BB, 
+        stage1 == "A" & stage2 == "B" ~ LINKAGE_AB, 
+        stage1 == "B" & stage2 == "A" ~ LINKAGE_BA
+      ),
+      
+      linkage_label = case_when(
+        stage1 == "A" & stage2 == "A" ~ 1, 
+        stage1 == "B" & stage2 == "B" ~ 2, 
+        stage1 == "A" & stage2 == "B" ~ 3, 
+        stage1 == "B" & stage2 == "A" ~ 4
+      ),
+      
+      # Generate the second stage response from linkage and individual response
+      Y2 = pmap_dbl(list(stage2, delta_a_j, delta_b_j, linkage), function(s2, da, db, beta) {
+        if (s2 == "A") {
+          rnorm(n = 1, mean = da * beta, sd = epsilon)
+        } else if (s2 == "B") {
+          rnorm(n = 1, mean = db * beta, sd = epsilon)
+        }
+      })
+    )
+  
+  return(data)
+}
+
+```
+
+# Simulation set up 
+
+```{r}
+# Number of times each cycle pattern gets repeated
+NUM_CYCLES = 4
+
+# Number of individuals in study
+J = 33
+
+# SD within patients
+epsilon = 0.1
+
+# Everyone in population has the same linkage 
+LINKAGE_AA = 1
+LINKAGE_BB = 1
+LINKAGE_AB = 0.6
+LINKAGE_BA = 0.8
+```
+
+## Level of heterogenitety among indivudal treatment effects
+```{r}
+# SD for true individual trt effect
+
+# low H
+# DELTA_A_SIGMA = 0.5
+# DELTA_B_SIGMA = 0.5
+
+# high H
+DELTA_A_SIGMA = 1
+DELTA_B_SIGMA = 1
+```
+
+## Scenario 1,3: assuming trt B have greater effect than A 
+```{r}
+# assuming B have effect
+# Set the value of the population level parameters
+DELTA_A_MU = 7.5/NUM_CYCLES # true population response rate of A
+DELTA_B_MU = (7.5 + 3.2) / NUM_CYCLES # true population response rate of B
+
+set.seed(1234)
+data_smartof1 = SMARTof1_cts_data_generation(J,DELTA_A_MU,DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                           LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA )
+
+# translate data into form that's better used by Stan
+SMARTof1.data = list(
+  J = J, 
+  cycle = NUM_CYCLES, 
+  resp1 = data_smartof1$Y1,
+  stay = data_smartof1$stay,
+  resp2 = data_smartof1$Y2, 
+  trt1 = if_else(data_smartof1$stage1 == "A", 1, 2),
+  trt2 = if_else(data_smartof1$stage2 == "A", 1, 2),
+  link = data_smartof1$linkage_label,
+  betas = c(LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA)
+)
+
+# truth = data_smartof1 %>% select(contains("delta")) %>% unique 
+truth = data_smartof1 %>% select(contains("delta")) %>% slice(which(row_number() %% NUM_CYCLES == 1)) %>% 
+  mutate(
+    
+    betaAA_j = LINKAGE_AA,
+    betaBB_j = LINKAGE_BB,
+    betaAB_j = LINKAGE_AB,
+    betaBA_j = LINKAGE_BA
+
+)
+
+set.seed(1234)
+data_nof1 = Nof1_cts_data_generation(J,DELTA_A_MU,DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                           LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA )
+
+nof1.data = list(
+  J = J, 
+  N = 2*NUM_CYCLES*J,
+  y = c(rbind(data_nof1$Y1, data_nof1$Y2)),
+  t = c(rbind(if_else(data_nof1$stage1 == "A", 0, 1),if_else(data_nof1$stage2 == "A", 0, 1))),
+  id = c(rbind(data_nof1$id,data_nof1$id))
+)
+  
+```
+
+## Scenario 2,4: assuming trt B have same effect than A 
+```{r}
+# noeffect
+# SMARTof1 data
+# 7 of them have individual
+J = 7
+DELTA_A_MU = 7.5/NUM_CYCLES # true population response rate of A
+
+# Eight of the participants had important individual improvements in fatigue on both the FACIT-F
+# subscale and WCFS scores, with seven having a positive effect greater than the clinically important difference
+# of eight on the FACIT-F score.
+# assume increase 15 over cycles
+DELTA_B_MU = (7.5 + 15) / NUM_CYCLES # true population response rate of B
+
+set.seed(1234)
+data1_smartof1 = SMARTof1_cts_data_generation(J,DELTA_A_MU,DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                           LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA )
+set.seed(1234)
+data1_nof1 = Nof1_cts_data_generation(J,DELTA_A_MU,DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                           LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA )
+
+
+# rest of them have no effect 
+J = 33-7
+DELTA_A_MU = 7.5/NUM_CYCLES # true population response rate of A
+DELTA_B_MU = 7.5 /NUM_CYCLES # true population response rate of B
+
+set.seed(1234)
+data2_smartof1 = SMARTof1_cts_data_generation(J,DELTA_A_MU,DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                           LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA )
+
+set.seed(1234)
+data2_nof1 = Nof1_cts_data_generation(J,DELTA_A_MU,DELTA_B_MU, DELTA_A_SIGMA, DELTA_B_SIGMA, epsilon, NUM_CYCLES,
+                           LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA )
+
+
+data2_smartof1$id=data2_smartof1$id+7
+data_smartof1  = rbind(data1_smartof1, data2_smartof1)
+
+data2_nof1$id=data2_nof1$id+7
+data_nof1  = rbind(data1_nof1, data2_nof1)
+
+J=33
+ 
+SMARTof1.data = list(
+  J = J, 
+  cycle = NUM_CYCLES, 
+  resp1 = data_smartof1$Y1,
+  stay = data_smartof1$stay,
+  resp2 = data_smartof1$Y2, 
+  trt1 = if_else(data_smartof1$stage1 == "A", 1, 2),
+  trt2 = if_else(data_smartof1$stage2 == "A", 1, 2),
+  link = data_smartof1$linkage_label,
+  betas = c(LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA)
+)
+
+# truth = data_smartof1 %>% select(contains("delta")) %>% unique 
+truth = data_smartof1 %>% select(contains("delta")) %>% slice(which(row_number() %% NUM_CYCLES == 1)) %>% 
+  mutate(
+    
+    betaAA_j = LINKAGE_AA,
+    betaBB_j = LINKAGE_BB,
+    betaAB_j = LINKAGE_AB,
+    betaBA_j = LINKAGE_BA
+
+)
+nof1.data = list(
+  J = J, 
+  N = 2*NUM_CYCLES*J,
+  y = c(rbind(data_nof1$Y1, data_nof1$Y2)),
+  t = c(rbind(if_else(data_nof1$stage1 == "A", 0, 1),if_else(data_nof1$stage2 == "A", 0, 1))),
+  id = c(rbind(data_nof1$id,data_nof1$id))
+)
+```
+
+# SMART-of-1 Models 
+```{r}
+tic1 = lubridate::now()
+ind <- sampling(stan_model(file='SMARTof1_cts_ind_model.stan'),
+               data = SMARTof1.data,
+               chains = 4,             # number of Markov chains
+               warmup = 2000,          # number of warmup iterations per chain
+               iter = 4000,           # total number of iterations per chain
+               refresh = 1,
+               verbose = TRUE,
+               core = 4,
+               control = list(adapt_delta = 0.99, max_treedepth = 15)
+               )
+toc1 = lubridate::now()
+toc1 - tic1
+
+tic2 = lubridate::now()
+agg <- sampling(stan_model(file='SMARTof1_cts_agg_model.stan'),
+               data = SMARTof1.data,
+               chains = 4,             # number of Markov chains
+               warmup = 2000,          # number of warmup iterations per chain
+               iter = 4000,           # total number of iterations per chain
+               core = 4,
+               refresh = 1,
+               verbose = FALSE,
+               #seed = 1,
+               control = list(adapt_delta = 0.99, max_treedepth = 15))
+
+toc2 = lubridate::now()
+toc2 - tic2
+ 
+```
+
+# N-of-1 Models
+```{r}
+tic4 = lubridate::now()
+agg <- sampling(stan_model(file='SMARTof1_cts_agg_model.stan'),
+               data = SMARTof1.data,
+               chains = 4,             # number of Markov chains
+               warmup = 2000,          # number of warmup iterations per chain
+               iter = 4000,           # total number of iterations per chain
+               core = 4,
+               refresh = 1,
+               verbose = FALSE,
+               #seed = 1,
+               control = list(adapt_delta = 0.99, max_treedepth = 15))
+
+toc4 = lubridate::now()
+toc4 - tic4
+
+ind2 <- sampling(stan_model(file='nof1_cts_ind.stan'),
+               data = nof1.data,
+                chains = 4,             # number of Markov chains
+               warmup = 2000,          # number of warmup iterations per chain
+               iter = 4000,           # total number of iterations per chain
+               core = 4,
+               refresh = 1,
+               verbose = FALSE,
+               #seed = 1,
+               control = list(adapt_delta = 0.99, max_treedepth = 15))
+
+
+
+agg2 <- sampling(stan_model(file='nof1_cts_agg.stan'),
+                 data = nof1.data,
+                chains = 4,             # number of Markov chains
+               warmup = 2000,          # number of warmup iterations per chain
+               iter = 4000,           # total number of iterations per chain
+               core = 4,
+               refresh = 1,
+               verbose = FALSE,
+               #seed = 1,
+               control = list(adapt_delta = 0.99, max_treedepth = 15))
+```
+
+# Individual model results
+```{r}
+# ci functions
+## SMART-of-1
+SMARTof1_ci_sd_function = function(sample,num_ind){
+  delta_A_ci = c()
+  delta_B_ci = c()
+  delta_A_sd = c()
+  delta_B_sd = c()
+  
+  delta_A_sample = sample[["delta"]][,1,]
+  delta_B_sample = sample[["delta"]][,2,]
+  for(j in 1: num_ind){
+    tempA_ci = ci(delta_A_sample[,j], method = "HDI",ci=0.95)
+    tempB_ci = ci(delta_B_sample[,j], method = "HDI",ci=0.95)
+    delta_A_ci = rbind(delta_A_ci,as.numeric(tempA_ci[2:3]))
+    delta_B_ci = rbind(delta_B_ci,as.numeric(tempB_ci[2:3]))
+    
+    tempA_sd = sd(delta_A_sample[,j])
+    tempB_sd = sd(delta_B_sample[,j])
+    delta_A_sd = rbind(delta_A_sd,as.numeric(tempA_sd))
+    delta_B_sd = rbind(delta_B_sd,as.numeric(tempB_sd))
+  }
+  delta_ci_sd = cbind(delta_A_ci,delta_B_ci,delta_A_sd,delta_B_sd )
+  colnames(delta_ci_sd) = c("delta_A_ci_l","delta_A_ci_u","delta_B_ci_l","delta_B_ci_u","delta_A_sd","delta_B_sd")
+  return(delta_ci_sd)
+}
+
+## n-of-1
+Nof1_ci_function = function(sample,num_ind){
+  delta_A_ci = c()
+  delta_B_ci = c()
+  delta_A_sd = c()
+  delta_B_sd = c()
+  
+  delta_A_sample = nof1_samples$beta1 
+  delta_B_sample = nof1_samples$beta1 + nof1_samples$beta2
+  
+  for(j in 1: num_ind){
+    tempA_ci = ci(delta_A_sample[,j], method = "HDI",ci=0.95)
+    tempB_ci = ci(delta_B_sample[,j], method = "HDI",ci=0.95)
+    delta_A_ci = rbind(delta_A_ci,as.numeric(tempA_ci[2:3]))
+    delta_B_ci = rbind(delta_B_ci,as.numeric(tempB_ci[2:3]))
+    
+    tempA_sd = sd(delta_A_sample[,j])
+    tempB_sd = sd(delta_B_sample[,j])
+    delta_A_sd = rbind(delta_A_sd,as.numeric(tempA_sd))
+    delta_B_sd = rbind(delta_B_sd,as.numeric(tempB_sd))
+  }
+  delta_ci_sd =  cbind(delta_A_ci,delta_B_ci,delta_A_sd,delta_B_sd )
+  colnames(delta_ci_sd) = c("delta_A_ci_l","delta_A_ci_u","delta_B_ci_l","delta_B_ci_u","delta_A_sd","delta_B_sd")
+  return(delta_ci_sd)
+}
+```
+
+
+```{r}
+# extract sample for SMARTof1
+SMARTof1_samples = extract(ind)
+# ci for SMARTof1
+SMARTof1_delta_ci_sd_ind = SMARTof1_ci_sd_function(SMARTof1_samples,J)
+# ind trt effects
+delta_mean = apply(SMARTof1_samples[["delta"]],c(2,3), mean)
+delta_bias = t(as.matrix(truth[c("delta_a_j","delta_b_j")])) - delta_mean
+SMARTof1_absBias_delta_IND = c(SMARTof1_absBias_deltaA_IND = mean(abs(delta_bias[1,])), SMARTof1_absBias_deltaB_IND = mean(abs(delta_bias[2,])))
+IND_bias_trt_file = cbind(truth[c("delta_a_j","delta_b_j")],t(delta_mean),t(delta_bias))
+
+
+# extract sample for nof1
+nof1_samples = extract(ind2)
+# ci of nof1
+Nof1_delta_ci_sd_ind = Nof1_ci_function(Nof1_samples,J)
+# ind trt effects 
+y_A_mean = apply(nof1_samples$beta1, 2, mean)
+y_B_mean = apply(nof1_samples$beta1 + nof1_samples$beta2, 2, mean)
+delta_mean = rbind(y_A_mean,y_B_mean)
+delta_bias = t(as.matrix(truth[c("delta_a_j","delta_b_j")])) - delta_mean
+Nof1_absBias_delta_IND = c(Nof1_absBias_deltaA_IND = mean(abs(delta_bias[1,])), Nof1_absBias_deltaB_IND = mean(abs(delta_bias[2,])))
+ 
+```
+
+# Aggregated model results 
+```{r}
+# SMARTOF1 
+SMARTof1_agg_samples = extract(agg)
+ 
+#  population delta
+delta_agg_mean = apply(SMARTof1_agg_samples[["delta_mu"]],2, mean)
+delta_agg_bias = abs(c(DELTA_A_MU,DELTA_B_MU) - delta_agg_mean)
+SMARTof1_absBias_delta_AGG = c(SMARTof1_absBias_deltaA_AGG = delta_agg_bias[1], SMARTof1_absBias_deltaB_AGG = delta_agg_bias[2])
+
+# population beta
+beta_agg_mean = apply(SMARTof1_agg_samples[["betas_mu"]],2, mean)
+delta_agg_bias = abs(c(LINKAGE_AA,LINKAGE_BB,LINKAGE_AB,LINKAGE_BA) - beta_agg_mean)
+SMARTof1_absBias_beta_AGG = c(SMARTof1_absBias_betaAA_AGG = delta_agg_bias[1], SMARTof1_absBias_betaBB_AGG = delta_agg_bias[2],SMARTof1_absBias_betaAB_AGG = delta_agg_bias[3], SMARTof1_absBias_betaBA_AGG = delta_agg_bias[4])
+
+# sd within patients
+SMARTof1_absBias_SD_within = c(SMARTof1_absBias_SD_within = abs(mean(SMARTof1_agg_samples$y_epsilon)-epsilon))
+
+# Nof1 
+nof1_agg_samples = extract(agg2)
+#  population delta
+y_A_mean = mean(nof1_agg_samples$beta_mu[,1])
+y_B_mean = mean(nof1_agg_samples$beta_mu[,1] + nof1_agg_samples$beta_mu[,2])
+delta_agg_bias = abs(c(DELTA_A_MU,DELTA_B_MU) - c(y_A_mean,y_B_mean))
+Nof1_absBias_delta_AGG = c(Nof1_absBias_deltaA_AGG = delta_agg_bias[1], Nof1_absBias_deltaB_AGG = delta_agg_bias[2])
+# sd within patients
+Nof1_absBias_SD_within = c(Nof1_absBias_SD_within=abs(mean(nof1_agg_samples$y_sig)-epsilon))
+ 
+```
+

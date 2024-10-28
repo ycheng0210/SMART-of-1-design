@@ -1,0 +1,719 @@
+---
+title: "smart-of-1 data generation"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r, message = F, warning = F }
+library(tidyverse)
+library(rstan)
+library(reshape)
+library(ggplot2)
+library(ggpubr)
+library(bayestestR)
+library(parallel)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+rstan_options(threads_per_chain = 1)
+
+```   
+
+# Functions
+```{r}
+# effects generation
+true_est_generation = function(J,DELTA_LOG_ODDS_A_MU,DELTA_LOG_ODDS_B_MU, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES) {
+  dt = tibble(
+  id = rep(1:J,each = NUM_CYCLES),
+  cycle_id = rep(c(1:NUM_CYCLES),J),
+  
+  # Draw from population distribution and generate individual-level response rates
+  trt_a_odds = rep(rnorm(J, mean = DELTA_LOG_ODDS_A_MU, sd = DELTA_LOG_ODDS_A_SIGMA), each = NUM_CYCLES),
+  delta_a_j = (exp(trt_a_odds) / (1 + exp(trt_a_odds)))  %>% round(3), 
+  trt_b_odds = rep(rnorm(J, mean = DELTA_LOG_ODDS_B_MU, sd = DELTA_LOG_ODDS_B_SIGMA), each = NUM_CYCLES),
+  delta_b_j = (exp(trt_b_odds) / (1 + exp(trt_b_odds))) %>% round(3),
+  
+  # Generate first stage treatments, alternating
+  stage1 = map2_chr(id,cycle_id, function(i,c) {
+    
+  if(i %% 2 == 1 & c %% 2 == 1){
+      stage1 = "A"
+  }else if(i %% 2 == 1 & c %% 2 == 0){
+      stage1 = "B"
+     
+  }else if(i %% 2 == 0 & c %% 2 == 1){
+      stage1 = "B" 
+  }else if(i %% 2 == 0 & c %% 2 == 0){
+      stage1 = "A" }
+  }
+ 
+  )
+  
+)
+  return(dt)
+}
+
+# dataset generation
+SMARTof1_binary_data_generation = function(data_tibble,LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA) {
+  data_tibble =  data_tibble %>% 
+   mutate(
+    # Generate the first stage response from the first stage treatment
+    Y1 = pmap_int(list(stage1, delta_a_j, delta_b_j), function(s1, da, db) {
+      
+      if (s1 == "A") {
+        rbinom(1, size = 1, prob = da)
+      } else if (s1 == "B")
+        rbinom(1, size = 1, prob = db)
+      
+      }),
+    stage2 = map2_chr(stage1, Y1, function(s1, y) {
+      
+      # Choose the other treatment if first stage fails
+      if (y == 0) {
+        setdiff(c("A", "B"), s1)
+        
+      # Otherwise, return the same treatment
+      } else {
+        s1
+      }
+    }),
+    linkage = case_when(
+      stage1 == "A" & stage2 == "A" ~ LINKAGE_AA, 
+      stage1 == "B" & stage2 == "B" ~ LINKAGE_BB, 
+      stage1 == "A" & stage2 == "B" ~ LINKAGE_AB, 
+      stage1 == "B" & stage2 == "A" ~ LINKAGE_BA, 
+    ),
+    linkage_label = case_when(
+      stage1 == "A" & stage2 == "A" ~ 1, 
+      stage1 == "B" & stage2 == "B" ~ 2, 
+      stage1 == "A" & stage2 == "B" ~ 3, 
+      stage1 == "B" & stage2 == "A" ~ 4
+    ),
+    # Generate the second stage response from linkage and individual response
+    Y2 = pmap_int(list(stage2, delta_a_j, delta_b_j, linkage), function(s2, da, db, beta) {
+      
+      if (s2 == "A") {
+        rbinom(1, size = 1, prob = da * beta)
+      } else if (s2 == "B")
+        rbinom(1, size = 1, prob = db * beta)
+      
+      })
+  )
+  return(data_tibble)
+}
+
+# ci generation for individual model
+ind_SMARTof1_ci_sd_function = function(sample,num_ind){
+  delta_A_ci = c()
+  delta_B_ci = c()
+  delta_A_sd = c()
+  delta_B_sd = c()
+  
+  
+  dtr_AB_ci = c()
+  dtr_BA_ci = c()
+  dtr_AB_sd = c()
+  dtr_BA_sd = c()
+  
+  delta_A_sample = sample[["delta"]][,1,]
+  delta_B_sample = sample[["delta"]][,2,]
+  
+  dtr_AB_sample = sample[["dtr_AB"]] 
+  dtr_BA_sample = sample[["dtr_BA"]]
+  
+  for(j in 1: num_ind){
+    
+    # ci sd for first stage response rate 
+    tempA_ci = ci(delta_A_sample[,j], method = "HDI",ci=0.95)
+    tempB_ci = ci(delta_B_sample[,j], method = "HDI",ci=0.95)
+    delta_A_ci = rbind(delta_A_ci,as.numeric(tempA_ci[2:3]))
+    delta_B_ci = rbind(delta_B_ci,as.numeric(tempB_ci[2:3]))
+    
+    tempA_sd = sd(delta_A_sample[,j])
+    tempB_sd = sd(delta_B_sample[,j])
+    delta_A_sd = rbind(delta_A_sd,as.numeric(tempA_sd))
+    delta_B_sd = rbind(delta_B_sd,as.numeric(tempB_sd))
+    
+    # ci sd for DTR rate
+    tempAB_ci = ci(dtr_AB_sample[,j], method = "HDI",ci=0.95)
+    tempBA_ci = ci(dtr_BA_sample[,j], method = "HDI",ci=0.95)
+    dtr_AB_ci = rbind(dtr_AB_ci,as.numeric(tempAB_ci[2:3]))
+    dtr_BA_ci = rbind(dtr_BA_ci,as.numeric(tempBA_ci[2:3]))
+    
+    tempAB_sd = sd(dtr_AB_sample[,j])
+    tempBA_sd = sd(dtr_BA_sample[,j])
+    dtr_AB_sd = rbind(dtr_AB_sd,as.numeric(tempAB_sd))
+    dtr_BA_sd = rbind(dtr_BA_sd,as.numeric(tempBA_sd))
+    
+  }
+  
+  ci_sd = cbind(delta_A_ci,delta_B_ci,delta_A_sd,delta_B_sd, dtr_AB_ci,dtr_BA_ci,dtr_AB_sd,dtr_BA_sd)
+  colnames(ci_sd) = c("delta_A_ci_l","delta_A_ci_u","delta_B_ci_l","delta_B_ci_u","delta_A_sd","delta_B_sd",
+                      "dtr_AB_ci_l","dtr_AB_ci_u","dtr_BA_ci_l","dtr_BA_ci_u","dtr_AB_sd","dtr_BA_sd")
+  return(ci_sd)
+}
+
+# ci generation for aggregated model
+agg_SMARTof1_ci_sd_function = function(sample){
+  
+ 
+  delta_A_sample = sample[["delta_mu"]][,1]
+  delta_B_sample = sample[["delta_mu"]][,2]
+  
+  dtr_AB_sample = sample[["dtr_AB"]] 
+  dtr_BA_sample = sample[["dtr_BA"]]
+  
+     
+    # ci sd for first stage response rate 
+    tempA_ci = ci(delta_A_sample, method = "HDI",ci=0.95)
+    tempB_ci = ci(delta_B_sample , method = "HDI",ci=0.95)
+
+    tempA_sd = sd(delta_A_sample )
+    tempB_sd = sd(delta_B_sample )
+  
+    # ci sd for DTR rate
+    tempAB_ci = ci(dtr_AB_sample , method = "HDI",ci=0.95)
+    tempBA_ci = ci(dtr_BA_sample , method = "HDI",ci=0.95)
+
+    tempAB_sd = sd(dtr_AB_sample )
+    tempBA_sd = sd(dtr_BA_sample )
+  
+  ci_sd = t(as.matrix(c(as.numeric(tempA_ci[2:3]),as.numeric(tempB_ci[2:3]),as.numeric(tempA_sd),as.numeric(tempB_sd), as.numeric(tempAB_ci[2:3]),as.numeric(tempBA_ci[2:3]),as.numeric(tempAB_sd),as.numeric(tempBA_sd))))
+  colnames(ci_sd) = c("delta_A_ci_l","delta_A_ci_u","delta_B_ci_l","delta_B_ci_u","delta_A_sd","delta_B_sd",
+                      "dtr_AB_ci_l","dtr_AB_ci_u","dtr_BA_ci_l","dtr_BA_ci_u","dtr_AB_sd","dtr_BA_sd")
+  return(ci_sd)
+} 
+```
+
+# Simulation set up
+```{r}
+# number of subjects
+J = 30
+# number of replicates
+nsim = 500
+
+# Set the value of the population level parameters
+DELTA_A = 0.4 # true population response rate of A
+DELTA_B = 0.6 # true population response rate of B
+
+# logit trt effects
+DELTA_LOG_ODDS_A_MU = log(DELTA_A / (1 - DELTA_A))
+DELTA_LOG_ODDS_B_MU = log(DELTA_B / (1 - DELTA_B))
+
+# SD among individual trt effects
+DELTA_LOG_ODDS_A_SIGMA = 0.05
+DELTA_LOG_ODDS_B_SIGMA = 0.05
+
+# Everyone in population has the same linkage 
+LINKAGE_AA = 1
+LINKAGE_BB = 1
+LINKAGE_AB = 0.6
+LINKAGE_BA = 0.8
+
+# SMARTof1 and snSMART cycle  
+NUM_CYCLES.SMARTof1 = 12
+NUM_CYCLES.SMART = 1
+
+# true population level delta and DTR 
+dtr_AB_true = DELTA_A * (DELTA_A * LINKAGE_AA) + (1 - DELTA_A) * (DELTA_B * LINKAGE_AB)
+dtr_BA_true = DELTA_B * (DELTA_B * LINKAGE_BB) + (1 - DELTA_B) * (DELTA_A * LINKAGE_BA)
+dtr_true = c(dtr_AB_true,dtr_BA_true)
+delta_true = c(DELTA_A,DELTA_B)
+```
+
+# Scenarios
+```{r}
+# Scenario 1 low hetero
+# 
+# set.seed(1)
+# data_tibble_SMARTof1_low = true_est_generation(J,DELTA_LOG_ODDS_A_MU,DELTA_LOG_ODDS_B_MU, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMARTof1 )
+# 
+# set.seed(1)
+# 
+# data_tibble_SMART_low = true_est_generation(J,DELTA_LOG_ODDS_A_MU,DELTA_LOG_ODDS_B_MU, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMART )
+# 
+# truth.low = data_tibble_SMART_low %>%  select(contains("delta")) %>% 
+#   mutate(
+#     
+#     betaAA_j = LINKAGE_AA,
+#     betaBB_j = LINKAGE_BB,
+#     betaAB_j = LINKAGE_AB,
+#     betaBA_j = LINKAGE_BA,
+#     DTR_AB_j = delta_a_j * (delta_a_j * betaAA_j) + (1 - delta_a_j) * (delta_b_j * betaAB_j),
+#     DTR_BA_j = delta_b_j * (delta_b_j * betaBB_j) + (1 - delta_b_j) * (delta_a_j * betaBA_j),
+# )
+
+# delta_ind_low = dtrAB_ind_low = dtrBA_ind_low = delta_agg_low = dtrAB_agg_low = dtrBA_agg_low = c()
+# delta_smart_low = dtrAB_smart_low = dtrBA_smart_low = c()
+
+# Scenario 2 high heterogeneity scenario (3 subgroups)
+J1 = J2 = J3 = J/3
+
+# group 1
+DELTA_A1 = 0.4  
+DELTA_B1 = 0.6  
+
+DELTA_LOG_ODDS_A_MU1 = log(DELTA_A1 / (1 - DELTA_A1))
+DELTA_LOG_ODDS_B_MU1 = log(DELTA_B1 / (1 - DELTA_B1))
+
+set.seed(1)
+
+dt1.SMARTof1 = true_est_generation(J1,DELTA_LOG_ODDS_A_MU1,DELTA_LOG_ODDS_B_MU1, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMARTof1 )
+
+
+set.seed(1)
+dt1.SMART = true_est_generation(J1,DELTA_LOG_ODDS_A_MU1,DELTA_LOG_ODDS_B_MU1, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMART )
+
+# group 2
+
+DELTA_A2 = 0.2 
+DELTA_B2 = 0.8  
+
+DELTA_LOG_ODDS_A_MU2 = log(DELTA_A2 / (1 - DELTA_A2))
+DELTA_LOG_ODDS_B_MU2 = log(DELTA_B2 / (1 - DELTA_B2))
+
+set.seed(1)
+dt2.SMARTof1 = true_est_generation(J2,DELTA_LOG_ODDS_A_MU2,DELTA_LOG_ODDS_B_MU2, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMARTof1 )
+
+set.seed(1)
+dt2.SMART = true_est_generation(J2,DELTA_LOG_ODDS_A_MU2,DELTA_LOG_ODDS_B_MU2, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMART )
+
+
+dt2.SMARTof1$id=dt2.SMARTof1$id+10
+dt2.SMART$id=dt2.SMART$id+10
+
+# group 3
+DELTA_A3 = 0.6  
+DELTA_B3 = 0.4  
+
+DELTA_LOG_ODDS_A_MU3 = log(DELTA_A3 / (1 - DELTA_A3))
+DELTA_LOG_ODDS_B_MU3 = log(DELTA_B3 / (1 - DELTA_B3))
+
+set.seed(1)
+dt3.SMARTof1 = true_est_generation(J3,DELTA_LOG_ODDS_A_MU3,DELTA_LOG_ODDS_B_MU3, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMARTof1 )
+
+set.seed(1)
+dt3.SMART = true_est_generation(J3,DELTA_LOG_ODDS_A_MU3,DELTA_LOG_ODDS_B_MU3, DELTA_LOG_ODDS_A_SIGMA, DELTA_LOG_ODDS_B_SIGMA, NUM_CYCLES.SMART )
+ 
+dt3.SMARTof1$id=dt3.SMARTof1$id+20
+dt3.SMART$id=dt3.SMART$id+20
+ 
+data_tibble_SMARTof1_high = rbind(dt1.SMARTof1, dt2.SMARTof1, dt3.SMARTof1)
+data_tibble_SMART_high = rbind(dt1.SMART, dt2.SMART, dt3.SMART)
+
+truth.high = data_tibble_SMART_high%>%  select(contains("delta")) %>%
+  mutate(
+    
+    betaAA_j = LINKAGE_AA,
+    betaBB_j = LINKAGE_BB,
+    betaAB_j = LINKAGE_AB,
+    betaBA_j = LINKAGE_BA,
+    DTR_AB_j = delta_a_j * (delta_a_j * betaAA_j) + (1 - delta_a_j) * (delta_b_j * betaAB_j),
+    DTR_BA_j = delta_b_j * (delta_b_j * betaBB_j) + (1 - delta_b_j) * (delta_a_j * betaBA_j),
+  )
+
+delta_ind_high = dtrAB_ind_high = dtrBA_ind_high = delta_agg_high = dtrAB_agg_high = dtrBA_agg_high = c()
+delta_smart_high = dtrAB_smart_high = dtrBA_smart_high = c()
+```
+
+# parallelized simulations  
+```{r}
+# example for high heterogeniety scenario
+run_simulation <- function(i, data_tibble_SMARTof1_high, data_tibble_SMART_high, LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA, J, NUM_CYCLES.SMARTof1, NUM_CYCLES.SMART) {
+  set.seed(i)
+  
+  data_smartof1_high <- SMARTof1_binary_data_generation(data_tibble_SMARTof1_high, LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA)
+  data_smart_high <- SMARTof1_binary_data_generation(data_tibble_SMART_high, LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA)
+  
+  standata.high.SMARTof1 <- list(
+    J = J,
+    cycle = NUM_CYCLES.SMARTof1,
+    resp1 = data_smartof1_high$Y1,
+    resp2 = data_smartof1_high$Y2,
+    trt1 = ifelse(data_smartof1_high$stage1 == "A", 1, 2),
+    trt2 = ifelse(data_smartof1_high$stage2 == "A", 1, 2),
+    link = data_smartof1_high$linkage_label,
+    betas = c(LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA)
+  )
+  
+  standata.high.SMART <- list(
+    J = J,
+    cycle = NUM_CYCLES.SMART,
+    resp1 = data_smart_high$Y1,
+    resp2 = data_smart_high$Y2,
+    trt1 = ifelse(data_smart_high$stage1 == "A", 1, 2),
+    trt2 = ifelse(data_smart_high$stage2 == "A", 1, 2),
+    link = data_smart_high$linkage_label,
+    betas = c(LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA)
+  )
+  
+  ind_model <- stan_model(file='SMARTof1_bi_ind_model.stan')
+  ind.high <- sampling(ind_model,
+                      data = standata.high.SMARTof1,
+                      chains = 1,
+                      warmup = 2000,
+                      iter = 4000,
+                      refresh = 1,
+                      verbose = FALSE,
+                      control = list(adapt_delta = 0.99, max_treedepth = 15))
+  
+  agg_model <- stan_model(file='SMARTof1_bi_agg_model.stan')
+  agg.high <- sampling(agg_model,
+                      data = standata.high.SMARTof1,
+                      chains = 1,
+                      warmup = 2000,
+                      iter = 4000,
+                      refresh = 1,
+                      verbose = FALSE,
+                      control = list(adapt_delta = 0.99, max_treedepth = 15))
+  
+  agg2_model <- stan_model(file='SMART_normal_prior.stan')
+  agg2.high <- sampling(agg2_model,
+                       data = standata.high.SMART,
+                       chains = 1,
+                       warmup = 2000,
+                       iter = 4000,
+                       refresh = 1,
+                       verbose = FALSE,
+                       control = list(adapt_delta = 0.99, max_treedepth = 15))
+  
+  ind_samples_high <- rstan::extract(ind.high)
+  saveRDS(ind_samples_high, file = paste0("bi_sim_data/500_12cycle_data_high/ind/ind_samples_high_", i, ".rds"))
+  
+  agg_samples_high <- rstan::extract(agg.high)
+  saveRDS(agg_samples_high, file = paste0("bi_sim_data/500_12cycle_data_high/agg/agg_samples_high_", i, ".rds"))
+  
+  agg2_samples_high <- rstan::extract(agg2.high)
+    saveRDS(agg2_samples_high, file = paste0("bi_sim_data/500_12cycle_data_high/smart/agg2_samples_high_", i, ".rds"))
+    
+  results <- list(
+    delta_ind_high = apply(ind_samples_high[["delta"]], c(2, 3), mean),
+    delta_agg_high = apply(agg_samples_high[["delta_mu"]], 2, mean),
+    delta_smart_high = apply(agg2_samples_high[["delta_mu"]], 2, mean),
+    dtrAB_ind_high = apply(ind_samples_high[["dtr_AB"]], 2, mean),
+    dtrAB_agg_high = mean(agg_samples_high[["dtr_AB"]]),
+    dtrAB_smart_high = mean(agg2_samples_high[["dtr_AB"]]),
+    dtrBA_ind_high = apply(ind_samples_high[["dtr_BA"]], 2, mean),
+    dtrBA_agg_high = mean(agg_samples_high[["dtr_BA"]]),
+    dtrBA_smart_high = mean(agg2_samples_high[["dtr_BA"]])
+  )
+  
+  return(results)
+}
+
+
+num_cores <- detectCores() - 1
+
+# Create a cluster
+cl <- makeCluster(num_cores)
+
+# Export necessary libraries and objects to the cluster
+clusterEvalQ(cl, {
+  library(dplyr)
+  library(purrr)  # Ensure purrr is loaded for pmap_int
+  library(rstan)
+})
+clusterExport(cl, c("data_tibble_SMARTof1_high", "data_tibble_SMART_high", "LINKAGE_AA", "LINKAGE_BB", "LINKAGE_AB", "LINKAGE_BA", "J", "NUM_CYCLES.SMARTof1", "NUM_CYCLES.SMART", "run_simulation", "SMARTof1_binary_data_generation", "sampling", "stan_model", "extract"))
+
+# Run the simulations in parallel
+results_list <- parLapply(cl, 1:nsim, function(i) run_simulation(i, data_tibble_SMARTof1_high, data_tibble_SMART_high, LINKAGE_AA, LINKAGE_BB, LINKAGE_AB, LINKAGE_BA, J, NUM_CYCLES.SMARTof1, NUM_CYCLES.SMART))
+
+# Stop the cluster
+stopCluster(cl)
+
+# combine result
+delta_ind_high <- do.call(rbind, lapply(results_list, function(x) x$delta_ind_high))
+delta_agg_high <- do.call(rbind, lapply(results_list, function(x) x$delta_agg_high))
+delta_smart_high <- do.call(rbind, lapply(results_list, function(x) x$delta_smart_high))
+dtrAB_ind_high <- do.call(rbind, lapply(results_list, function(x) x$dtrAB_ind_high))
+dtrAB_agg_high <- do.call(rbind, lapply(results_list, function(x) x$dtrAB_agg_high))
+dtrAB_smart_high <- do.call(rbind, lapply(results_list, function(x) x$dtrAB_smart_high))
+dtrBA_ind_high <- do.call(rbind, lapply(results_list, function(x) x$dtrBA_ind_high))
+dtrBA_agg_high <- do.call(rbind, lapply(results_list, function(x) x$dtrBA_agg_high))
+dtrBA_smart_high <- do.call(rbind, lapply(results_list, function(x) x$dtrBA_smart_high))
+
+save(list=c("delta_ind_high", "dtrAB_ind_high", "dtrBA_ind_high", "delta_agg_high", "dtrAB_agg_high", "dtrBA_agg_high", "delta_smart_high", "dtrAB_smart_high", "dtrBA_smart_high","truth.high", "DELTA_A","DELTA_B","LINKAGE_AA","LINKAGE_BB","LINKAGE_AB","LINKAGE_BA"
+),file = "bi_sim_data/500_12cycle_data_high/data.rdata")
+
+```
+
+# Model estimates
+```{r}
+# SMARTof1 ind estimates
+##  delta
+deltaA_ind_high_mean = apply(delta_ind_high[seq(1, nrow(delta_ind_high), by = 2),],2,mean)
+deltaB_ind_high_mean = apply(delta_ind_high[seq(2, nrow(delta_ind_high), by = 2), ],2,mean)
+
+deltaA_ind_high_bias = abs(deltaA_ind_high_mean-truth.high$delta_a_j)
+mean(deltaA_ind_high_bias)
+
+deltaB_ind_high_bias = abs(deltaB_ind_high_mean-truth.high$delta_b_j)
+mean(deltaB_ind_high_bias)
+
+## dtr
+dtrAB_ind_high_mean = apply(dtrAB_ind_high,2,mean)
+dtrBA_ind_high_mean = apply(dtrBA_ind_high,2,mean)
+
+dtrAB_ind_high_bias = abs(dtrAB_ind_high_mean-truth.high$DTR_AB_j)
+mean(dtrAB_ind_high_bias)
+
+dtrBA_ind_high_bias = abs(dtrBA_ind_high_mean-truth.high$DTR_BA_j)
+mean(dtrBA_ind_high_bias)
+
+# SMARTof1 agg estimates
+## delta
+deltaA_agg_high_mean = mean(delta_agg_high[,1])
+deltaB_agg_high_mean = mean(delta_agg_high[,2])
+delta_agg_high_mean = c(deltaA_agg_high_mean,deltaB_agg_high_mean)
+abs(delta_agg_high_mean-delta_true)
+
+deltaA_agg_high_sd = sd(delta_agg_high[,1])
+deltaB_agg_high_sd = sd(delta_agg_high[,2])
+
+## dtr
+dtrAB_agg_high_mean = mean(dtrAB_agg_high)
+dtrBA_agg_high_mean = mean(dtrBA_agg_high)
+dtr_agg_high_mean = c(dtrAB_agg_high_mean,dtrBA_agg_high_mean)
+abs(dtr_agg_high_mean-dtr_true)
+
+dtrAB_agg_high_sd = sd(dtrAB_agg_high)
+dtrBA_agg_high_sd = sd(dtrBA_agg_high)
+
+# SMART estimates
+## delta
+deltaA_smart_high_mean = mean(delta_smart_high[,1])
+deltaB_smart_high_mean = mean(delta_smart_high[,2])
+delta_smart_high_mean = c(deltaA_smart_high_mean,deltaB_smart_high_mean)
+abs(delta_smart_high_mean-delta_true)
+
+deltaA_smart_high_sd = sd(delta_smart_high[,1])
+deltaB_smart_high_sd = sd(delta_smart_high[,2])
+
+## dtr
+dtrAB_smart_high_mean = mean(dtrAB_smart_high)
+dtrBA_smart_high_mean = mean(dtrBA_smart_high)
+dtr_smart_high_mean = c(dtrAB_smart_high_mean,dtrBA_smart_high_mean)
+abs(dtr_smart_high_mean-dtr_true)
+
+dtrAB_smart_high_sd = sd(dtrAB_smart_high)
+dtrBA_smart_high_sd = sd(dtrBA_smart_high)
+
+# put into files
+deltaA_ind_file = data.frame(ID = 1:J, truth=truth.high$delta_a_j, deltaA_hat = deltaA_ind_high_mean, bias =  deltaA_ind_high_bias)
+deltaB_ind_file = data.frame(ID = 1:J, truth=truth.high$delta_b_j, deltaB_hat = deltaB_ind_high_mean, bias =  deltaB_ind_high_bias)
+dtrAB_ind_file = data.frame(ID = 1:J, truth=truth.high$DTR_AB_j, dtrAB_hat = dtrAB_ind_high_mean, bias =  dtrAB_ind_high_bias)
+dtrBA_ind_file = data.frame(ID = 1:J, truth=truth.high$DTR_BA_j, dtrBA_hat = dtrBA_ind_high_mean, bias =  dtrBA_ind_high_bias)
+ 
+# write.csv(deltaA_ind_file,"bi_sim_data/500_12cycle_data_high/deltaA_ind_file.csv")
+# write.csv(deltaB_ind_file,"bi_sim_data/500_12cycle_data_high/deltaB_ind_file.csv")
+# write.csv(dtrAB_ind_file,"bi_sim_data/500_12cycle_data_high/dtrAB_ind_file.csv")
+# write.csv(dtrBA_ind_file,"bi_sim_data/500_12cycle_data_high/dtrBA_ind_file.csv")
+```
+
+# Visualization 
+## Individual model: delta estimates
+```{r}
+# high hetero
+deltaA_long = as.data.frame(delta_ind_high[seq(1, nrow(delta_ind_high), by = 2),]) %>%
+  mutate(
+    sim = 1:nsim
+  )%>%
+  pivot_longer(
+    cols = -sim,  
+    names_to = "ID", 
+    values_to = "deltaA_est"  
+  )
+
+deltaB_long = as.data.frame(delta_ind_high[seq(2, nrow(delta_ind_high), by = 2),]) %>%
+  mutate(
+    sim = 1:nsim
+  )%>%
+  pivot_longer(
+    cols = -sim,  
+    names_to = "ID",  
+    values_to = "deltaB_est"  
+  )
+
+deltaA_table_SMARTof1 = deltaA_long%>%
+  group_by(ID)%>%
+  summarise(min=min(deltaA_est),mean = mean(deltaA_est),max=max(deltaA_est))%>%
+  mutate(
+    ID = as.numeric(str_replace(ID, "^V", ""))
+  )%>% 
+  arrange(ID)
+ 
+deltaB_table_SMARTof1 = deltaB_long%>%
+  group_by(ID)%>%
+  summarise(min=min(deltaB_est),mean = mean(deltaB_est),max=max(deltaB_est))%>%
+  mutate(
+    ID = as.numeric(str_replace(ID, "^V", ""))
+  )%>% 
+  arrange(ID)
+
+truth.high = cbind(ID = 1:J, truth.high)
+
+# join
+deltaA_table = cbind(deltaA_table_SMARTof1,truth = truth.high$delta_a_j)
+deltaB_table = cbind(deltaB_table_SMARTof1,truth = truth.high$delta_b_j)
+
+high_agg_smart = data.frame(
+  Parameter = c("pi_A","pi_B"),
+  Truth = delta_true,
+  SMART = c(deltaA_smart_high_mean,deltaB_smart_high_mean),
+  SMARTof1 = c(deltaA_agg_high_mean,deltaB_agg_high_mean)
+)%>% 
+ pivot_longer(cols = c(SMART, SMARTof1), 
+               names_to = "Model", 
+               values_to = "Value")%>%
+  mutate(
+    bias = Truth - Value,
+    sd = c(deltaA_smart_high_sd,deltaA_agg_high_sd,deltaB_smart_high_sd,deltaB_agg_high_sd),
+    rmse = sqrt(bias^2 + sd^2)
+  )
+
+# individual estimates
+p1a = ggplot(data = deltaA_table , 
+       aes(x = ID, y = mean, ymin = min, ymax = max)) +
+  geom_pointrange(position = position_dodge(width = 1),size = 0.2) +
+  scale_x_continuous(breaks = seq(0,J, by = 1))+
+  theme(axis.text.x=element_text(size=8 ))+ylim(0,1)+
+  geom_point(aes(y = truth), color = "red", shape = 4, size = 3) + # Add true values
+  labs(title = "Individual Model: Treatment A Estimate",
+       x = "ID",
+       y = "Treatment A Estimates",
+       caption = "")
+
+p1b = ggplot(data = deltaB_table, 
+       aes(x = ID, y = mean, ymin = min, ymax = max)) +
+  geom_pointrange(position = position_dodge(width = 1),size = 0.2) +
+     scale_x_continuous(breaks = seq(0,J, by = 1))+
+  theme(axis.text.x=element_text(size=8 ))+ylim(0,1)+
+    geom_point(aes(y = truth), color = "red", shape = 4, size = 3)  
+   labs(title = "Individual Model: Treatment B Estimates",
+       x = "ID",
+       y = "Treatment B Estimates",
+       caption = "")
+```
+
+## Population level delta bias RMSE: SMARTof1 vs SMART
+```{r}
+p2a = ggplot(high_agg_smart, aes(x = Parameter, y = bias, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge",width = 0.5) +
+  labs(title = "Population Model: SMART vs.Aggregated SMARTof1 Estimates",
+       x = "Parameter",
+       y = "Bias") +
+  theme_minimal()+
+  scale_fill_grey()
+
+p2c = ggplot(high_agg_smart, aes(x = Parameter, y = rmse, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge",width = 0.5) +
+  labs(title = "Population Model: SMART vs.Aggregated SMARTof1 Estimates",
+       x = "Parameter",
+       y = "RMSE") +
+  theme_minimal()+
+  scale_fill_grey()
+
+```
+
+## Individual model: DTR estimates
+```{r}
+dtrAB_long = as.data.frame(dtrAB_ind_high) %>%
+  mutate(
+    sim = 1:nsim
+  )%>%
+  pivot_longer(
+    cols = -sim, 
+    names_to = "ID",  
+    values_to = "dtrAB_est"  
+  )
+
+dtrBA_long = as.data.frame(dtrBA_ind_high) %>%
+  mutate(
+    sim = 1:nsim
+  )%>%
+  pivot_longer(
+    cols = -sim,  
+    names_to = "ID",  
+    values_to = "dtrBA_est"  
+  )
+
+dtrAB_table_SMARTof1 = dtrAB_long%>%
+  group_by(ID)%>%
+  summarise(min=min(dtrAB_est),mean = mean(dtrAB_est),max=max(dtrAB_est))%>%
+  mutate(
+    ID = as.numeric(str_replace(ID, "^V", ""))
+  )%>% 
+  arrange(ID)
+ 
+ dtrBA_table_SMARTof1 = dtrBA_long%>%
+  group_by(ID)%>%
+  summarise(min=min(dtrBA_est),mean = mean(dtrBA_est),max=max(dtrBA_est))%>%
+  mutate(
+    ID = as.numeric(str_replace(ID, "^V", ""))
+  )%>% 
+  arrange(ID)
+  
+# join
+dtrAB_table = cbind(dtrAB_table_SMARTof1,truth = truth.high$DTR_AB_j)
+dtrBA_table = cbind(dtrBA_table_SMARTof1,truth = truth.high$DTR_BA_j)
+
+high_agg_smart = data.frame(
+  Parameter = c("DTR_AB","DTR_BA"),
+  Truth = dtr_true,
+  SMART = c(dtrAB_smart_high_mean,dtrBA_smart_high_mean),
+  SMARTof1 = c(dtrAB_agg_high_mean,dtrBA_agg_high_mean)
+)%>% 
+   pivot_longer(cols = c(SMART, SMARTof1), 
+               names_to = "Model", 
+               values_to = "Value")%>%
+  mutate(
+    bias = Truth - Value,
+    sd = c(dtrAB_smart_high_sd,dtrAB_agg_high_sd,dtrBA_smart_high_sd,dtrBA_agg_high_sd),
+    rmse = sqrt(bias^2 + sd^2)
+  )
+
+ 
+p1c= ggplot(data = dtrAB_table, 
+       aes(x = ID, y = mean, ymin = min, ymax = max)) +
+  geom_pointrange(position = position_dodge(width = 1),size = 0.2) +
+  scale_x_continuous(breaks = seq(0,J, by = 1))+
+  theme(axis.text.x=element_text(size=8 ))+ylim(0,1)+
+   geom_point(aes(y = truth), color = "red", shape = 4, size = 3) + # Add true values
+  labs(title = "Individual Model: DTR AB Estimate",
+       x = "ID",
+       y = "DTR AB Estimates",
+       caption = "")
+ 
+
+p1d = ggplot(data = dtrBA_table, 
+       aes(x = ID, y = mean, ymin = min, ymax = max)) +
+  geom_pointrange(position = position_dodge(width = 1),size = 0.2) +
+  scale_x_continuous(breaks = seq(0,J, by = 1))+
+  theme(axis.text.x=element_text(size=8 ))+ylim(0,1)+
+   geom_point(aes(y = truth), color = "red", shape = 4, size = 3) + # Add true values
+  labs(title = "Individual Model: DTR BA Estimate",
+       x = "ID",
+       y = "DTR BA Estimates",
+       caption = "")
+```
+
+## Population level DTR bias RMSE: SMARTof1 vs SMART
+```{r}
+p2b = ggplot(high_agg_smart, aes(x = Parameter, y = bias, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge",width = 0.5) +
+  labs(title = "Population Model: SMART vs.Aggregated SMARTof1 Estimates",
+       x = "Parameter",
+       y = "Bias") +
+  theme_minimal()+
+  scale_fill_grey()
+ 
+p2d = ggplot(high_agg_smart, aes(x = Parameter, y = rmse, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge",width = 0.5) +
+  labs(title = "Population Model: SMART vs.Aggregated SMARTof1 Estimates",
+       x = "Parameter",
+       y = "RMSE") +
+  theme_minimal()+
+  scale_fill_grey()
+ 
+
+```
